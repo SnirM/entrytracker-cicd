@@ -25,12 +25,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # 3) Run app in background (standalone, no Docker)
+      # 3) Run unit tests (curl) - start app in background on 5001
       - name: Start app (background)
         run: |
-          nohup python app.py > app.log 2>&1 &
+          nohup env PORT=5001 python app.py > app.log 2>&1 &
           for i in {1..20}; do
-            if curl -sSf http://127.0.0.1:5000/ > /dev/null; then
+            if curl -sSf http://127.0.0.1:5001/ > /dev/null; then
               echo "App is up"
               exit 0
             fi
@@ -41,23 +41,27 @@ jobs:
           cat app.log
           exit 1
 
-      # 4) Unit test (curl)
       - name: Unit test (curl)
         run: |
-          curl -sSf http://127.0.0.1:5000/ | tee unit_response.json
+          curl -sSf http://127.0.0.1:5001/ | tee unit_response.json
 
-      # 5) Package (Docker image)
+      # 4) Package (Docker image)
       - name: Build Docker image
         run: |
           docker build -t entrytracker:latest .
 
-      # 6) E2E (docker compose + curl)
+      # חשוב: לעצור את ה-standalone לפני E2E כדי שלא יתפוס פורטים/תהליכים
+      - name: Stop standalone app
+        run: |
+          pkill -f "python app.py" || true
+
+      # 5) End-to-end (E2E) tests with docker-compose
       - name: E2E up (compose)
         run: |
           docker compose -f docker-compose.yaml up -d
           docker compose -f docker-compose.yaml ps
 
-          # Wait for app endpoint to be ready
+          # wait for app endpoint
           for i in {1..40}; do
             if curl -sSf http://127.0.0.1:5000/ > /dev/null; then
               echo "E2E is up"
@@ -69,7 +73,7 @@ jobs:
 
           curl -sSf http://127.0.0.1:5000/ | tee e2e_response.json
 
-      # 7) Cleanup always
+      # Cleanup always
       - name: E2E cleanup
         if: always()
         run: |
