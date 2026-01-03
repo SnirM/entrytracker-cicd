@@ -4,9 +4,8 @@ on:
   push:
     branches: [ "main" ]
 
-# חובה ל-OIDC מול AWS
 permissions:
-  id-token: write
+  id-token: write   # חובה ל-OIDC
   contents: read
 
 jobs:
@@ -17,13 +16,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # OIDC -> AssumeRole (לוקח ARN מה-Secret שהוספת)
+      # מנקה תווי CR ורווחים מה-Variables כדי ש-Docker לא ייכשל
+      - name: Sanitize variables
+        run: |
+          echo "AWS_REGION=$(echo '${{ vars.AWS_REGION }}' | tr -d '\r' | xargs)" >> $GITHUB_ENV
+          echo "ECR_REGISTRY=$(echo '${{ vars.ECR_REGISTRY }}' | tr -d '\r' | xargs)" >> $GITHUB_ENV
+          echo "ECR_REPOSITORY=$(echo '${{ vars.ECR_REPOSITORY }}' | tr -d '\r' | xargs)" >> $GITHUB_ENV
+
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ vars.AWS_REGION }}
-          role-session-name: github-actions-entrytracker
+          aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
@@ -34,49 +38,53 @@ jobs:
 
       - name: Tag image
         run: |
-          docker tag entrytracker:latest ${{ vars.ECR_REGISTRY }}/${{ vars.ECR_REPOSITORY }}:latest
-          docker tag entrytracker:latest ${{ vars.ECR_REGISTRY }}/${{ vars.ECR_REPOSITORY }}:${{ github.sha }}
+          docker tag entrytracker:latest $ECR_REGISTRY/$ECR_REPOSITORY:latest
 
       - name: Push image to ECR
         run: |
-          docker push ${{ vars.ECR_REGISTRY }}/${{ vars.ECR_REPOSITORY }}:latest
-          docker push ${{ vars.ECR_REGISTRY }}/${{ vars.ECR_REPOSITORY }}:${{ github.sha }}
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
 
   deploy:
     runs-on: ubuntu-latest
     needs: build-and-push
 
     steps:
+      - name: Sanitize variables (deploy)
+        run: |
+          echo "EC2_HOST=$(echo '${{ vars.EC2_HOST }}' | tr -d '\r' | xargs)" >> $GITHUB_ENV
+          echo "EC2_USER=$(echo '${{ vars.EC2_USER }}' | tr -d '\r' | xargs)" >> $GITHUB_ENV
+          echo "AWS_REGION=$(echo '${{ vars.AWS_REGION }}' | tr -d '\r' | xargs)" >> $GITHUB_ENV
+          echo "ECR_REGISTRY=$(echo '${{ vars.ECR_REGISTRY }}' | tr -d '\r' | xargs)" >> $GITHUB_ENV
+          echo "ECR_REPOSITORY=$(echo '${{ vars.ECR_REPOSITORY }}' | tr -d '\r' | xargs)" >> $GITHUB_ENV
+
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ vars.AWS_REGION }}
-          role-session-name: github-actions-entrytracker-deploy
+          aws-region: ${{ env.AWS_REGION }}
 
-      - name: Deploy to EC2 over SSH
+      - name: Deploy to EC2 via SSH
         uses: appleboy/ssh-action@v1.0.3
         with:
-          host: ${{ vars.EC2_HOST }}
-          username: ${{ vars.EC2_USER }}
+          host: ${{ env.EC2_HOST }}
+          username: ${{ env.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
           script: |
             set -e
 
-            echo "Login to ECR..."
-            aws ecr get-login-password --region ${{ vars.AWS_REGION }} \
-              | docker login --username AWS --password-stdin ${{ vars.ECR_REGISTRY }}
+            # ודא שיש Docker
+            docker --version
 
-            echo "Pull latest image..."
-            docker pull ${{ vars.ECR_REGISTRY }}/${{ vars.ECR_REPOSITORY }}:latest
+            # התחברות ל-ECR מתוך השרת
+            aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY
 
-            # כדי ש-docker-compose.yaml שלך ימשיך לעבוד גם אם הוא מצפה ל-entrytracker:latest
-            docker tag ${{ vars.ECR_REGISTRY }}/${{ vars.ECR_REPOSITORY }}:latest entrytracker:latest
+            # משיכה של האימג' החדש
+            docker pull $ECR_REGISTRY/$ECR_REPOSITORY:latest
 
-            echo "Go to app folder and restart..."
-            cd ~/entrytracker-cicd || cd ~/
+            # עצירה והסרה אם רץ כבר
+            docker rm -f entrytracker || true
 
-            docker compose down || true
-            docker compose up -d
+            # הרצה מחדש
+            docker run -d --name entrytracker -p 5000:5000 $ECR_REGISTRY/$ECR_REPOSITORY:latest
 
-            echo "Done."
+            docker ps | grep entrytracker
