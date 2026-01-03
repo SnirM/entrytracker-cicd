@@ -84,8 +84,8 @@ jobs:
       - name: Deploy via SSM
         run: |
           aws ssm send-command \
-            --instance-ids "i-07851d2f6027c9577" \
             --document-name "AWS-RunShellScript" \
+            --targets "Key=instanceids,Values=i-07851d2f6027c9577" \
             --region "ap-south-1" \
             --parameters 'commands=[
               "sudo yum update -y",
