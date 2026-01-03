@@ -10,6 +10,20 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    
+    services:
+      mysql:
+        image: mysql:5.7
+        env:
+          MYSQL_ROOT_PASSWORD: password
+          MYSQL_DATABASE: app_db
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=3
 
     steps:
       - name: Checkout code
@@ -23,10 +37,22 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Wait for MySQL
+        run: |
+          until nc -z localhost 3306; do
+            echo "Waiting for MySQL..."
+            sleep 2
+          done
+
       - name: Unit Test
+        env:
+          DB_HOST: localhost
+          DB_USER: root
+          DB_PASSWORD: password
+          DB_NAME: app_db
         run: |
           python app.py & 
-          sleep 5
+          sleep 10
           curl --fail http://localhost:5000 || exit 1
           kill $!
 
