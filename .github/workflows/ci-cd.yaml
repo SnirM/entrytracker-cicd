@@ -19,11 +19,7 @@ jobs:
           MYSQL_DATABASE: app_db
         ports:
           - 3306:3306
-        options: >-
-          --health-cmd="mysqladmin ping"
-          --health-interval=10s
-          --health-timeout=5s
-          --health-retries=3
+        options: --health-cmd="mysqladmin ping" --health-interval=10s --health-timeout=5s --health-retries=3
 
     steps:
       - name: Checkout code
@@ -39,12 +35,13 @@ jobs:
 
       - name: Wait for MySQL
         run: |
+          sudo apt-get update && sudo apt-get install -y netcat-openbsd
           until nc -z localhost 3306; do
-            echo "Waiting for MySQL..."
+            echo "Waiting for MySQL to be ready..."
             sleep 2
           done
 
-      - name: Unit Test
+      - name: Unit Test (Run App and Check)
         env:
           DB_HOST: localhost
           DB_USER: root
@@ -53,7 +50,7 @@ jobs:
         run: |
           python app.py & 
           sleep 10
-          curl --fail http://localhost:5000 || exit 1
+          curl -v --fail http://localhost:5000 || exit 1
           kill $!
 
       - name: Configure AWS credentials
@@ -74,26 +71,3 @@ jobs:
         run: |
           docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-
-  deploy:
-    needs: build-and-test
-    runs-on: ubuntu-latest
-    steps:
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v2
-        with:
-          role-to-assume: arn:aws:iam::807650718119:role/github-actions-entrytracker-role
-          aws-region: ap-south-1
-
-      - name: Deploy via SSM
-        run: |
-          aws ssm send-command \
-            --instance-ids "${{ vars.EC2_INSTANCE_ID }}" \
-            --document-name "AWS-RunShellScript" \
-            --parameters 'commands=[
-              "aws ecr get-login-password --region ap-south-1 | docker login --username AWS --password-stdin 807650718119.dkr.ecr.ap-south-1.amazonaws.com",
-              "docker pull 807650718119.dkr.ecr.ap-south-1.amazonaws.com/entrytracker:latest",
-              "docker stop entrytracker_app || true",
-              "docker rm entrytracker_app || true",
-              "docker run -d --name entrytracker_app -p 5000:5000 807650718119.dkr.ecr.ap-south-1.amazonaws.com/entrytracker:latest"
-            ]'
