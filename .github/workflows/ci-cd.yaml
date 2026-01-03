@@ -82,10 +82,10 @@ jobs:
           role-to-assume: arn:aws:iam::807650718119:role/github-actions-entrytracker-role
           aws-region: ap-south-1
 
-     - name: Deploy via SSM
+      - name: Deploy via SSM
         run: |
           aws ssm send-command \
-            --instance-ids "i-07851d2f6027c9577" \
+            --instance-ids "${{ vars.EC2_INSTANCE_ID }}" \
             --document-name "AWS-RunShellScript" \
             --parameters 'commands=[
               "aws ecr get-login-password --region ap-south-1 | docker login --username AWS --password-stdin 807650718119.dkr.ecr.ap-south-1.amazonaws.com",
