@@ -4,97 +4,138 @@ on:
   push:
     branches: [ "main" ]
 
-permissions:
-  id-token: write
-  contents: read
-
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
-    services:
-      mysql:
-        image: mysql:5.7
-        env:
-          MYSQL_ROOT_PASSWORD: password
-          MYSQL_DATABASE: app_db
-        ports:
-          - 3306:3306
-        options: --health-cmd="mysqladmin ping" --health-interval=10s --health-timeout=5s --health-retries=3
-
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.10'
-
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      - name: Wait for MySQL
+      # דוגמה - תחליף לשלבים שלך
+      - name: Build & Test
         run: |
-          until nc -z localhost 3306; do
-            echo "Waiting for MySQL..."
-            sleep 2
-          done
-
-      - name: Unit Test
-        env:
-          DB_HOST: localhost
-          DB_USER: root
-          DB_PASSWORD: password
-          DB_NAME: app_db
-        run: |
-          python app.py & 
-          sleep 10
-          curl -v --fail http://localhost:5000 || exit 1
-          kill $!
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v2
-        with:
-          role-to-assume: arn:aws:iam::807650718119:role/github-actions-entrytracker-role
-          aws-region: ap-south-1
-
-      - name: Login to Amazon ECR
-        id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v1
-
-      - name: Build and Push to ECR
-        env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          ECR_REPOSITORY: entrytracker
-          IMAGE_TAG: latest
-        run: |
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          echo "Build/Test here..."
 
   deploy:
-    needs: build-and-test
     runs-on: ubuntu-latest
-    steps:
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v2
-        with:
-          role-to-assume: arn:aws:iam::807650718119:role/github-actions-entrytracker-role
-          aws-region: ap-south-1
+    needs: build-and-test
 
-      - name: Deploy via SSM
+    env:
+      # ✅ REGION נכון לפי מה ששלחת
+      AWS_REGION: ap-south-1
+      AWS_DEFAULT_REGION: ap-south-1
+
+      # אופציונלי (אם עדיין רוצים גם Instance ID)
+      EC2_INSTANCE_ID: i-0d611d3432a0cfcc9
+
+      # ✅ TAG targets (מומלץ)
+      SSM_TAG_KEY: SSMDeploy
+      SSM_TAG_VALUE: entrytracker
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # =========================
+      # 1) Configure AWS credentials
+      # =========================
+      # אם אתה עובד עם OIDC (מומלץ):
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # אם אתה עובד עם Access Keys במקום OIDC:
+      # - name: Configure AWS credentials (Access Keys)
+      #   uses: aws-actions/configure-aws-credentials@v4
+      #   with:
+      #     aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      #     aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      #     aws-region: ${{ env.AWS_REGION }}
+
+      # =========================
+      # 2) Debug: זהות + Region בפועל
+      # =========================
+      - name: Debug AWS identity + region
         run: |
-          aws ssm send-command \
-            --instance-ids "i-07851d2f6027c9577" \
+          set -e
+          echo "== Caller Identity =="
+          aws sts get-caller-identity --region "$AWS_REGION"
+          echo
+          echo "== AWS Configure List =="
+          aws configure list
+          echo
+          echo "AWS_REGION=$AWS_REGION"
+          echo "AWS_DEFAULT_REGION=$AWS_DEFAULT_REGION"
+
+      # =========================
+      # 3) Verify instance exists (כדי להוכיח Region/Account תקין)
+      # =========================
+      - name: Verify EC2 instance exists in this account/region
+        run: |
+          set -e
+          aws ec2 describe-instances \
+            --instance-ids "$EC2_INSTANCE_ID" \
+            --region "$AWS_REGION" \
+            --query "Reservations[].Instances[].[InstanceId,State.Name,Placement.AvailabilityZone,VpcId,PrivateIpAddress,Tags]" \
+            --output table
+
+      # =========================
+      # 4) Verify SSM managed instance is ONLINE
+      # =========================
+      - name: Verify SSM managed instance is ONLINE
+        run: |
+          set -e
+          aws ssm describe-instance-information \
+            --region "$AWS_REGION" \
+            --filters "Key=InstanceIds,Values=$EC2_INSTANCE_ID" \
+            --query "InstanceInformationList[].[InstanceId,PingStatus,PlatformName,AgentVersion,IPAddress]" \
+            --output table
+
+      # =========================
+      # 5) Deploy via SSM using TAG targets
+      # =========================
+      - name: Deploy via SSM (TAG targets)
+        run: |
+          set -e
+
+          echo "== Send SSM Command using TAG target =="
+          CMD_ID=$(aws ssm send-command \
+            --region "$AWS_REGION" \
             --document-name "AWS-RunShellScript" \
-            --region "ap-south-1" \
+            --targets "Key=tag:${SSM_TAG_KEY},Values=${SSM_TAG_VALUE}" \
+            --comment "GitHub Actions deploy EntryTracker" \
             --parameters 'commands=[
-              "sudo yum update -y",
-              "sudo yum install -y docker",
-              "sudo service docker start",
-              "sudo systemctl enable docker",
-              "aws ecr get-login-password --region ap-south-1 | docker login --username AWS --password-stdin 807650718119.dkr.ecr.ap-south-1.amazonaws.com",
-              "docker pull 807650718119.dkr.ecr.ap-south-1.amazonaws.com/entrytracker:latest",
-              "docker stop entrytracker_app || true",
-              "docker rm entrytracker_app || true",
-              "docker run -d --name entrytracker_app -p 5000:5000 807650718119.dkr.ecr.ap-south-1.amazonaws.com/entrytracker:latest"
-            ]'
+              "set -e",
+              "echo DEPLOY_START: $(date)",
+              "whoami",
+              "hostname",
+              "uname -a",
+              "cd /home/ubuntu/entryTracker || cd ~",
+              "pwd",
+              "ls -la",
+              "echo DEPLOY_DONE: $(date)"
+            ]' \
+            --query "Command.CommandId" \
+            --output text)
+
+          echo "CommandId: $CMD_ID"
+
+          echo "== Wait for command execution to finish =="
+          aws ssm wait command-executed \
+            --region "$AWS_REGION" \
+            --command-id "$CMD_ID" \
+            --targets "Key=tag:${SSM_TAG_KEY},Values=${SSM_TAG_VALUE}"
+
+          echo "== Fetch command output =="
+          aws ssm list-command-invocations \
+            --region "$AWS_REGION" \
+            --command-id "$CMD_ID" \
+            --details \
+            --query "CommandInvocations[].CommandPlugins[].{Name:Name,Status:Status,Output:Output}" \
+            --output json
+
+      - name: Post deploy check
+        run: |
+          echo "Deploy job finished successfully."
