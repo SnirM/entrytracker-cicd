@@ -87,6 +87,7 @@ jobs:
             --document-name "AWS-RunShellScript" \
             --targets "Key=instanceids,Values=i-07851d2f6027c9577" \
             --region "ap-south-1" \
+            --comment "Deploying version latest" \
             --parameters 'commands=[
               "sudo yum update -y",
               "sudo amazon-linux-extras install docker -y || sudo yum install docker -y",
