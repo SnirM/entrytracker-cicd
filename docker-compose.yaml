@@ -1,34 +1,31 @@
+version: '3.8'
 services:
   mysql:
     image: mysql:5.7
-    container_name: entrytracker-mysql
+    container_name: mysql_db
     environment:
       MYSQL_ROOT_PASSWORD: password
       MYSQL_DATABASE: app_db
     ports:
       - "3306:3306"
-    volumes:
-      - mysql_data:/var/lib/mysql
-    healthcheck:
-      test: ["CMD-SHELL", "mysqladmin ping -h localhost -ppassword --silent"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
+    networks:
+      - app-network
 
-  entrytracker:
-    image: entrytracker:latest
-    container_name: entrytracker-app
-    depends_on:
-      mysql:
-        condition: service_healthy
+  app:
+    image: ${ECR_REGISTRY}/${ECR_REPOSITORY}:latest
+    container_name: entrytracker_app
+    ports:
+      - "5000:5000"
     environment:
       DB_HOST: mysql
       DB_USER: root
       DB_PASSWORD: password
       DB_NAME: app_db
-    ports:
-      - "5000:5000"
-    restart: always
+    depends_on:
+      - mysql
+    networks:
+      - app-network
 
-volumes:
-  mysql_data:
+networks:
+  app-network:
+    driver: bridge
