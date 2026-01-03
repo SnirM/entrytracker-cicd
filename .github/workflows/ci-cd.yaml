@@ -23,7 +23,7 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Unit Test (Run App and Check)
+      - name: Unit Test
         run: |
           python app.py & 
           sleep 5
@@ -40,7 +40,7 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v1
 
-      - name: Build, tag, and push image to Amazon ECR
+      - name: Build and Push to ECR
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.registry }}
           ECR_REPOSITORY: entrytracker
@@ -59,13 +59,15 @@ jobs:
           role-to-assume: arn:aws:iam::807650718119:role/github-actions-entrytracker-role
           aws-region: ap-south-1
 
-      - name: Deploy to EC2 via SSM
+      - name: Deploy via SSM
         run: |
           aws ssm send-command \
             --instance-ids "${{ vars.EC2_INSTANCE_ID }}" \
             --document-name "AWS-RunShellScript" \
             --parameters 'commands=[
               "aws ecr get-login-password --region ap-south-1 | docker login --username AWS --password-stdin 807650718119.dkr.ecr.ap-south-1.amazonaws.com",
-              "cd /home/ubuntu && docker-compose pull",
-              "cd /home/ubuntu && docker-compose up -d"
+              "docker pull 807650718119.dkr.ecr.ap-south-1.amazonaws.com/entrytracker:latest",
+              "docker stop entrytracker_app || true",
+              "docker rm entrytracker_app || true",
+              "docker run -d --name entrytracker_app -p 5000:5000 807650718119.dkr.ecr.ap-south-1.amazonaws.com/entrytracker:latest"
             ]'
