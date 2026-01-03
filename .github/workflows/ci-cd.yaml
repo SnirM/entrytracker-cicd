@@ -2,8 +2,7 @@ name: EntryTracker CI/CD
 
 on:
   push:
-    branches:
-      - main
+    branches: [ "main" ]
 
 jobs:
   build-and-push:
@@ -18,28 +17,38 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Sanitize variables (remove CR/LF/spaces)
+        run: |
+          clean() { printf "%s" "$1" | tr -d '\r\n' | xargs; }
+          echo "AWS_REGION=$(clean '${{ vars.AWS_REGION }}')" >> $GITHUB_ENV
+          echo "ECR_REGISTRY=$(clean '${{ vars.ECR_REGISTRY }}')" >> $GITHUB_ENV
+          echo "ECR_REPOSITORY=$(clean '${{ vars.ECR_REPOSITORY }}')" >> $GITHUB_ENV
+
+      - name: Debug (show sanitized values)
+        run: |
+          echo "AWS_REGION=|$AWS_REGION|"
+          echo "ECR_REGISTRY=|$ECR_REGISTRY|"
+          echo "ECR_REPOSITORY=|$ECR_REPOSITORY|"
+
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ vars.AWS_REGION }}
+          aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
 
       - name: Build Docker image
-        run: |
-          docker build -t entrytracker .
+        run: docker build -t entrytracker .
 
       - name: Tag Docker image
         run: |
-          docker tag entrytracker:latest \
-            ${{ vars.ECR_REGISTRY }}/${{ vars.ECR_REPOSITORY }}:latest
+          docker tag entrytracker:latest "$ECR_REGISTRY/$ECR_REPOSITORY:latest"
 
       - name: Push Docker image to ECR
         run: |
-          docker push \
-            ${{ vars.ECR_REGISTRY }}/${{ vars.ECR_REPOSITORY }}:latest
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:latest"
 
   deploy:
     name: Deploy to EC2
@@ -51,39 +60,34 @@ jobs:
       contents: read
 
     steps:
+      - name: Sanitize deploy variables
+        run: |
+          clean() { printf "%s" "$1" | tr -d '\r\n' | xargs; }
+          echo "AWS_REGION=$(clean '${{ vars.AWS_REGION }}')" >> $GITHUB_ENV
+          echo "ECR_REGISTRY=$(clean '${{ vars.ECR_REGISTRY }}')" >> $GITHUB_ENV
+          echo "ECR_REPOSITORY=$(clean '${{ vars.ECR_REPOSITORY }}')" >> $GITHUB_ENV
+          echo "EC2_HOST=$(clean '${{ vars.EC2_HOST }}')" >> $GITHUB_ENV
+          echo "EC2_USER=$(clean '${{ vars.EC2_USER }}')" >> $GITHUB_ENV
+
       - name: Deploy to EC2 via SSH
         uses: appleboy/ssh-action@v1.0.3
         with:
-          host: ${{ vars.EC2_HOST }}
-          username: ${{ vars.EC2_USER }}
+          host: ${{ env.EC2_HOST }}
+          username: ${{ env.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
           script: |
             set -e
 
-            REGISTRY="${{ vars.ECR_REGISTRY }}"
-            REPO="${{ vars.ECR_REPOSITORY }}"
-            REGION="${{ vars.AWS_REGION }}"
+            REGISTRY="${ECR_REGISTRY}"
+            REPO="${ECR_REPOSITORY}"
+            REGION="${AWS_REGION}"
             IMAGE="$REGISTRY/$REPO:latest"
 
             echo "Deploying $IMAGE"
 
-            # Login to ECR
             aws ecr get-login-password --region "$REGION" | sudo docker login --username AWS --password-stdin "$REGISTRY"
-
-            # Pull latest image
             sudo docker pull "$IMAGE"
-
-            # Stop old container if exists
             sudo docker rm -f entrytracker || true
-
-            # Run new container
-            sudo docker run -d \
-              --name entrytracker \
-              --restart unless-stopped \
-              -p 5000:5000 \
-              "$IMAGE"
-
-            # Cleanup
+            sudo docker run -d --name entrytracker --restart unless-stopped -p 5000:5000 "$IMAGE"
             sudo docker image prune -f
-
             echo "Deployment finished successfully"
