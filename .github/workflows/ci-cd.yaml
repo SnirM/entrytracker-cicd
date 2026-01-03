@@ -4,7 +4,6 @@ on:
   push:
     branches: [ "main" ]
 
-# זה החלק שחסר לך - הרשאות גלובליות לכל ה-Workflow
 permissions:
   id-token: write
   contents: read
@@ -85,9 +84,13 @@ jobs:
       - name: Deploy via SSM
         run: |
           aws ssm send-command \
-            --instance-ids "${{ vars.EC2_INSTANCE_ID }}" \
+            --instance-ids "i-07851d2f6027c9577" \
             --document-name "AWS-RunShellScript" \
+            --region "ap-south-1" \
             --parameters 'commands=[
+              "sudo yum update -y",
+              "sudo amazon-linux-extras install docker -y || sudo yum install docker -y",
+              "sudo service docker start",
               "aws ecr get-login-password --region ap-south-1 | docker login --username AWS --password-stdin 807650718119.dkr.ecr.ap-south-1.amazonaws.com",
               "docker pull 807650718119.dkr.ecr.ap-south-1.amazonaws.com/entrytracker:latest",
               "docker stop entrytracker_app || true",
