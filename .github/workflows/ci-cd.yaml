@@ -2,89 +2,75 @@ name: EntryTracker CI/CD
 
 on:
   push:
-    branches: [ "main" ]
-
-permissions:
-  id-token: write   # חובה ל-OIDC
-  contents: read
+    branches:
+      - main
 
 jobs:
   build-and-push:
+    name: Build & Push to ECR
     runs-on: ubuntu-latest
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+    permissions:
+      id-token: write
+      contents: read
 
-      # מנקה תווי CR ורווחים מה-Variables כדי ש-Docker לא ייכשל
-      - name: Sanitize variables
-        run: |
-          echo "AWS_REGION=$(echo '${{ vars.AWS_REGION }}' | tr -d '\r' | xargs)" >> $GITHUB_ENV
-          echo "ECR_REGISTRY=$(echo '${{ vars.ECR_REGISTRY }}' | tr -d '\r' | xargs)" >> $GITHUB_ENV
-          echo "ECR_REPOSITORY=$(echo '${{ vars.ECR_REPOSITORY }}' | tr -d '\r' | xargs)" >> $GITHUB_ENV
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
 
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
+          aws-region: ${{ vars.AWS_REGION }}
 
       - name: Login to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
 
       - name: Build Docker image
         run: |
-          docker build -t entrytracker:latest .
+          docker build -t entrytracker .
 
-      - name: Tag image
+      - name: Tag Docker image
         run: |
-          docker tag entrytracker:latest $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          docker tag entrytracker:latest \
+          ${{ vars.ECR_REGISTRY }}/${{ vars.ECR_REPOSITORY }}:latest
 
-      - name: Push image to ECR
+      - name: Push Docker image to ECR
         run: |
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          docker push \
+          ${{ vars.ECR_REGISTRY }}/${{ vars.ECR_REPOSITORY }}:latest
 
   deploy:
+    name: Deploy to EC2
     runs-on: ubuntu-latest
     needs: build-and-push
 
     steps:
-      - name: Sanitize variables (deploy)
-        run: |
-          echo "EC2_HOST=$(echo '${{ vars.EC2_HOST }}' | tr -d '\r' | xargs)" >> $GITHUB_ENV
-          echo "EC2_USER=$(echo '${{ vars.EC2_USER }}' | tr -d '\r' | xargs)" >> $GITHUB_ENV
-          echo "AWS_REGION=$(echo '${{ vars.AWS_REGION }}' | tr -d '\r' | xargs)" >> $GITHUB_ENV
-          echo "ECR_REGISTRY=$(echo '${{ vars.ECR_REGISTRY }}' | tr -d '\r' | xargs)" >> $GITHUB_ENV
-          echo "ECR_REPOSITORY=$(echo '${{ vars.ECR_REPOSITORY }}' | tr -d '\r' | xargs)" >> $GITHUB_ENV
-
-      - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-
       - name: Deploy to EC2 via SSH
         uses: appleboy/ssh-action@v1.0.3
         with:
-          host: ${{ env.EC2_HOST }}
-          username: ${{ env.EC2_USER }}
+          host: ${{ vars.EC2_HOST }}
+          username: ${{ vars.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
           script: |
             set -e
 
-            # ודא שיש Docker
+            echo "Docker version:"
             docker --version
 
-            # התחברות ל-ECR מתוך השרת
-            aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY
+            echo "Login to ECR"
+            aws ecr get-login-password --region ap-south-1 | \
+              docker login --username AWS --password-stdin 80765078119.dkr.ecr.ap-south-1.amazonaws.com
 
-            # משיכה של האימג' החדש
-            docker pull $ECR_REGISTRY/$ECR_REPOSITORY:latest
+            echo "Pull image"
+            docker pull 80765078119.dkr.ecr.ap-south-1.amazonaws.com/entrytracker:latest
 
-            # עצירה והסרה אם רץ כבר
+            echo "Stop old container"
             docker rm -f entrytracker || true
 
-            # הרצה מחדש
-            docker run -d --name entrytracker -p 5000:5000 $ECR_REGISTRY/$ECR_REPOSITORY:latest
-
-            docker ps | grep entrytracker
+            echo "Run new container"
+            docker run -d \
+              --name entrytracker \
+              -p 80:5000 \
+              80765078119.dkr.ecr.ap-south-1.amazonaws.com/entrytracker:latest
