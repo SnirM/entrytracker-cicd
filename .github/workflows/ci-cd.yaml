@@ -2,7 +2,7 @@ name: CI/CD Pipeline
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
 
 permissions:
   contents: write
@@ -32,26 +32,23 @@ jobs:
   version:
     name: Version (Patch++)
     runs-on: ubuntu-latest
-    needs: [ build-and-test ]
+    needs: [build-and-test]
     outputs:
       image_tag: ${{ steps.bump.outputs.tag }}
     steps:
-      - name: Checkout
+      - name: Checkout (with tags history)
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # צריך היסטוריה בשביל tags
+          fetch-depth: 0
 
       - name: Bump patch version and create git tag
         id: bump
         shell: bash
         run: |
           set -euo pipefail
-
           git fetch --tags
 
-          # קח את הטאג האחרון בפורמט vX.Y.Z, אם אין - מתחילים מ-v1.0.0
-          LAST_TAG=$(git tag -l "v[0-9]*.[0-9]*.[0-9]*" --sort=-v:refname | head -n 1 || true)
-
+          LAST_TAG="$(git tag -l "v[0-9]*.[0-9]*.[0-9]*" --sort=-v:refname | head -n 1 || true)"
           if [ -z "${LAST_TAG}" ]; then
             NEW_TAG="v1.0.0"
           else
@@ -65,19 +62,23 @@ jobs:
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag "${NEW_TAG}"
-          git push origin "${NEW_TAG}"
+
+          # אם אותו Tag כבר קיים (למשל rerun על אותו commit) - לא נכשיל.
+          if git rev-parse "${NEW_TAG}" >/dev/null 2>&1; then
+            echo "Tag ${NEW_TAG} already exists, skipping tag create."
+          else
+            git tag "${NEW_TAG}"
+            git push origin "${NEW_TAG}"
+          fi
 
           echo "tag=${NEW_TAG}" >> "$GITHUB_OUTPUT"
 
   build-and-push:
     name: Build & Push to ECR
     runs-on: ubuntu-latest
-    needs: [ version ]
+    needs: [version]
     env:
       AWS_REGION: ${{ secrets.AWS_REGION }}
-      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
       AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
       ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
       IMAGE_TAG: ${{ needs.version.outputs.image_tag }}
@@ -87,40 +88,47 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Configure AWS credentials
+      - name: Configure AWS credentials (ECR push)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ env.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ env.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
 
       - name: Login to ECR
         uses: aws-actions/amazon-ecr-login@v2
 
       - name: Build Docker image
         run: |
+          set -euo pipefail
           docker build -t "${ECR_REPOSITORY}:${IMAGE_TAG}" .
 
       - name: Tag & Push
         run: |
+          set -euo pipefail
           ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+
           docker tag "${ECR_REPOSITORY}:${IMAGE_TAG}" "${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
           docker push "${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
 
-          # אופציונלי: תתייג גם latest (נוח)
+          # נוח: latest
           docker tag "${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}" "${ECR_REGISTRY}/${ECR_REPOSITORY}:latest"
           docker push "${ECR_REGISTRY}/${ECR_REPOSITORY}:latest"
 
   deploy:
     name: Deploy to EC2 (docker compose)
     runs-on: ubuntu-latest
-    needs: [ build-and-push ]
+    needs: [build-and-push]
     env:
       AWS_REGION: ${{ secrets.AWS_REGION }}
       AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
       ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+
       EC2_HOST: ${{ secrets.EC2_HOST }}
       EC2_USER: ${{ secrets.EC2_USER }}
+
+      EC2_SG_ID: ${{ secrets.EC2_SG_ID }}
+
       IMAGE_TAG: ${{ needs.build-and-push.outputs.image_tag }}
     steps:
       - name: Create SSH key file
@@ -131,29 +139,63 @@ jobs:
           echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/ec2_key.pem
           chmod 600 ~/.ssh/ec2_key.pem
 
+      #  צריך AWS Credentials גם בשביל לפתוח/לסגור פורט 22 זמנית
+      - name: Configure AWS credentials (for SG open/close)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Temporarily allow SSH from this GitHub runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          RUNNER_IP="$(curl -s https://checkip.amazonaws.com)/32"
+          echo "Runner public IP: ${RUNNER_IP}"
+          echo "Using SG: ${EC2_SG_ID}"
+
+          aws ec2 authorize-security-group-ingress \
+            --group-id "${EC2_SG_ID}" \
+            --ip-permissions "IpProtocol=tcp,FromPort=22,ToPort=22,IpRanges=[{CidrIp=${RUNNER_IP},Description='TEMP GitHub Actions SSH'}]" \
+          || echo "SSH rule may already exist (continuing)"
+
       - name: Deploy via SSH
         shell: bash
         run: |
           set -euo pipefail
-
           ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
 
-          ssh -o StrictHostKeyChecking=no -i ~/.ssh/ec2_key.pem "${EC2_USER}@${EC2_HOST}" << EOF
+          ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15 -i ~/.ssh/ec2_key.pem "${EC2_USER}@${EC2_HOST}" << EOF
             set -e
 
             cd /home/ubuntu/entrytracker-cicd
 
+            export AWS_REGION="${AWS_REGION}"
             export ECR_REGISTRY="${ECR_REGISTRY}"
             export ECR_REPOSITORY="${ECR_REPOSITORY}"
             export IMAGE_TAG="${IMAGE_TAG}"
 
-            # התחברות ל-ECR (ה-EC2 שלך כבר עם Role, אז זה עובד בלי keys)
+            # EC2 עם IAM Role -> אין צורך להחזיק keys על השרת
             aws ecr get-login-password --region "${AWS_REGION}" | docker login --username AWS --password-stdin "${ECR_REGISTRY}"
 
-            # pull + restart
             docker compose pull
             docker compose up -d --remove-orphans
 
             docker image prune -f || true
             docker compose ps
           EOF
+
+      # תמיד נסגור גם אם ה-deploy נפל
+      - name: Revoke temporary SSH rule (always)
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          RUNNER_IP="$(curl -s https://checkip.amazonaws.com)/32"
+          echo "Revoking Runner IP: ${RUNNER_IP} from SG: ${EC2_SG_ID}"
+
+          aws ec2 revoke-security-group-ingress \
+            --group-id "${EC2_SG_ID}" \
+            --ip-permissions "IpProtocol=tcp,FromPort=22,ToPort=22,IpRanges=[{CidrIp=${RUNNER_IP}}]" \
+          || true
