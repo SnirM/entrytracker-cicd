@@ -35,7 +35,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ✅ Credentials דרך Secrets (Access Keys)
+      # Credentials דרך Secrets (Access Keys)
       - name: Configure AWS credentials (Access Keys)
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -77,7 +77,7 @@ jobs:
             --output table
 
       # Deploy דרך SSM עם TAG target
-      - name: Deploy via SSM (TAG targets)
+            - name: Deploy via SSM (TAG targets)
         run: |
           set -e
 
@@ -107,7 +107,7 @@ jobs:
           aws ssm wait command-executed \
             --region "$AWS_REGION" \
             --command-id "$CMD_ID" \
-            --targets "Key=tag:${SSM_TAG_KEY},Values=${SSM_TAG_VALUE}"
+            --instance-id "$EC2_INSTANCE_ID"
 
           echo "== Fetch command output =="
           aws ssm list-command-invocations \
@@ -116,7 +116,3 @@ jobs:
             --details \
             --query "CommandInvocations[].CommandPlugins[].{Name:Name,Status:Status,Output:Output}" \
             --output json
-
-      - name: Post deploy check
-        run: |
-          echo "Deploy job finished successfully."
