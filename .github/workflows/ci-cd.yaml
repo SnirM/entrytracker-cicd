@@ -42,14 +42,8 @@ jobs:
       - name: Debug AWS identity + region
         run: |
           set -e
-          echo "== Caller Identity =="
           aws sts get-caller-identity --region "$AWS_REGION"
-          echo
-          echo "== AWS Configure List =="
           aws configure list
-          echo
-          echo "AWS_REGION=$AWS_REGION"
-          echo "AWS_DEFAULT_REGION=$AWS_DEFAULT_REGION"
 
       - name: Verify EC2 instance exists in this account/region
         run: |
@@ -69,26 +63,55 @@ jobs:
             --query "InstanceInformationList[].[InstanceId,PingStatus,PlatformName,AgentVersion]" \
             --output table
 
-      - name: Deploy via SSM (TAG targets) + print stdout/stderr on failure
+      - name: Deploy via SSM (TAG targets) + robust path detection
         shell: bash
         run: |
           set -euo pipefail
 
           echo "== Send SSM Command using TAG target =="
+
+          # NOTE: לא משתמשים פה ב-set -e בתחילת הסקריפט על השרת
+          # כדי ש-CD שלא קיים לא יפיל הכל. נבדוק ידנית.
           CMD_ID=$(aws ssm send-command \
             --region "$AWS_REGION" \
             --document-name "AWS-RunShellScript" \
             --targets "Key=tag:${SSM_TAG_KEY},Values=${SSM_TAG_VALUE}" \
             --comment "GitHub Actions deploy EntryTracker" \
             --parameters 'commands=[
-              "set -eux",
               "echo DEPLOY_START: $(date)",
-              "whoami",
-              "hostname",
-              "uname -a",
-              "cd /home/ubuntu/entryTracker || cd ~",
-              "pwd",
-              "ls -la",
+              "echo RUN_AS=$(id -un) UID=$(id -u) HOME=$HOME SHELL=$SHELL",
+              "",
+              "# נריץ את עיקר העבודה כ-ubuntu כדי ש-~ יעבוד ונתיבים יהיו צפויים",
+              "if id ubuntu >/dev/null 2>&1; then",
+              "  RUN_AS_USER=ubuntu",
+              "else",
+              "  RUN_AS_USER=$(id -un)",
+              "fi",
+              "echo Using user: $RUN_AS_USER",
+              "",
+              "run_as() {",
+              "  if [ \"$RUN_AS_USER\" = \"ubuntu\" ] && [ \"$(id -un)\" = \"root\" ]; then",
+              "    sudo -u ubuntu -H bash -lc \"$1\"",
+              "  else",
+              "    bash -lc \"$1\"",
+              "  fi",
+              "}",
+              "",
+              "run_as \"echo USER=\$(whoami); echo HOME=\$HOME; pwd\"",
+              "run_as \"uname -a\"",
+              "",
+              "# ננסה למצוא את הפרויקט בכמה מקומות נפוצים במקום לנחש",
+              "run_as \"for d in /home/ubuntu/entryTracker /home/ubuntu/entrytracker ~/entryTracker ~/entrytracker /opt/entryTracker /opt/entrytracker; do",
+              "  if [ -d \\\"$d\\\" ]; then",
+              "    echo FOUND_PROJECT_DIR=$d",
+              "    cd \\\"$d\\\"",
+              "    pwd",
+              "    ls -la",
+              "    exit 0",
+              "  fi",
+              "done",
+              "echo PROJECT_DIR_NOT_FOUND; echo listing /home/ubuntu and ~; ls -la /home/ubuntu || true; ls -la ~ || true; exit 2\"",
+              "",
               "echo DEPLOY_DONE: $(date)"
             ]' \
             --query "Command.CommandId" \
@@ -105,7 +128,6 @@ jobs:
           WAIT_RC=$?
           set -e
 
-          echo "== Get invocation status =="
           STATUS=$(aws ssm get-command-invocation \
             --region "$AWS_REGION" \
             --command-id "$CMD_ID" \
@@ -133,15 +155,16 @@ jobs:
 
           echo
           echo "== Response Code =="
-          aws ssm get-command-invocation \
+          RC=$(aws ssm get-command-invocation \
             --region "$AWS_REGION" \
             --command-id "$CMD_ID" \
             --instance-id "$EC2_INSTANCE_ID" \
             --query "ResponseCode" \
-            --output text || true
+            --output text || true)
+          echo "$RC"
 
-          if [ "$WAIT_RC" -ne 0 ] || [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ] || [ "$STATUS" = "TimedOut" ]; then
-            echo "SSM command failed (status=$STATUS, wait_rc=$WAIT_RC)"
+          if [ "$WAIT_RC" -ne 0 ] || [ "$STATUS" != "Success" ]; then
+            echo "SSM command failed (status=$STATUS, wait_rc=$WAIT_RC, rc=$RC)"
             exit 1
           fi
 
