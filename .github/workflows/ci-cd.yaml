@@ -11,7 +11,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # החלף לתהליך הבילד/טסט שלך
+      # החלף כאן את שלבי הבילד/טסט האמיתיים שלך
       - name: Build & Test
         run: |
           echo "Build/Test here..."
@@ -24,10 +24,10 @@ jobs:
       AWS_REGION: ap-south-1
       AWS_DEFAULT_REGION: ap-south-1
 
-      # Instance ID שלך (לפי מה ששלחת קודם)
+      # Instance ID שלך
       EC2_INSTANCE_ID: i-0d611d3432a0cfcc9
 
-      # TAG targets - חובה לשים את הטאג הזה על האינסטנס
+      # TAG target (ודא שהטאג הזה קיים על האינסטנס)
       SSM_TAG_KEY: SSMDeploy
       SSM_TAG_VALUE: entrytracker
 
@@ -35,7 +35,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Credentials דרך Secrets (Access Keys)
+      # ✅ AWS Credentials מתוך GitHub Secrets
       - name: Configure AWS credentials (Access Keys)
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -43,7 +43,7 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ap-south-1
 
-      # Debug: מי אני + באיזה region אני
+      # ✅ Debug: לוודא Account + Region בפועל
       - name: Debug AWS identity + region
         run: |
           set -e
@@ -56,7 +56,7 @@ jobs:
           echo "AWS_REGION=$AWS_REGION"
           echo "AWS_DEFAULT_REGION=$AWS_DEFAULT_REGION"
 
-      # בדיקה שהאינסטנס באמת קיים בחשבון/region הנכון
+      # ✅ בדיקה שהאינסטנס קיים בחשבון/אזור הנכונים
       - name: Verify EC2 instance exists in this account/region
         run: |
           set -e
@@ -66,7 +66,7 @@ jobs:
             --query "Reservations[].Instances[].[InstanceId,State.Name,Placement.AvailabilityZone,VpcId,PrivateIpAddress]" \
             --output table
 
-      # בדיקה שהאינסטנס רשום ב-SSM (Managed instance) וב-Online
+      # ✅ בדיקה שהאינסטנס רשום ל-SSM ובסטטוס Online
       - name: Verify SSM managed instance is ONLINE
         run: |
           set -e
@@ -76,8 +76,8 @@ jobs:
             --query "InstanceInformationList[].[InstanceId,PingStatus,PlatformName,AgentVersion]" \
             --output table
 
-      # Deploy דרך SSM עם TAG target
-            - name: Deploy via SSM (TAG targets)
+      # Deploy דרך SSM (TAG targets) + Wait נכון עם instance-id
+      - name: Deploy via SSM (TAG targets)
         run: |
           set -e
 
@@ -116,3 +116,7 @@ jobs:
             --details \
             --query "CommandInvocations[].CommandPlugins[].{Name:Name,Status:Status,Output:Output}" \
             --output json
+
+      - name: Post deploy check
+        run: |
+          echo "Deploy job finished successfully."
