@@ -2,172 +2,158 @@ name: CI/CD Pipeline
 
 on:
   push:
-    branches: ["main"]
+    branches: [ "main" ]
+
+permissions:
+  contents: write
 
 jobs:
   build-and-test:
+    name: Build & Test
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build & Test
-        run: |
-          echo "Build/Test here..."
-
-  deploy:
-    runs-on: ubuntu-latest
-    needs: build-and-test
-
-    env:
-      AWS_REGION: ap-south-1
-      AWS_DEFAULT_REGION: ap-south-1
-
-      EC2_INSTANCE_ID: i-0d611d3432a0cfcc9
-
-      SSM_TAG_KEY: SSMDeploy
-      SSM_TAG_VALUE: entrytracker
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Configure AWS credentials (Access Keys)
-        uses: aws-actions/configure-aws-credentials@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ap-south-1
+          python-version: "3.11"
 
-      - name: Debug AWS identity + region
+      - name: Install deps
         run: |
-          set -e
-          aws sts get-caller-identity --region "$AWS_REGION"
-          aws configure list
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-      - name: Verify EC2 instance exists in this account/region
+      - name: Basic app import test
         run: |
-          set -e
-          aws ec2 describe-instances \
-            --instance-ids "$EC2_INSTANCE_ID" \
-            --region "$AWS_REGION" \
-            --query "Reservations[].Instances[].[InstanceId,State.Name,Placement.AvailabilityZone,VpcId,PrivateIpAddress]" \
-            --output table
+          python -c "import app; print('app import OK')"
 
-      - name: Verify SSM managed instance is ONLINE
-        run: |
-          set -e
-          aws ssm describe-instance-information \
-            --region "$AWS_REGION" \
-            --filters "Key=InstanceIds,Values=$EC2_INSTANCE_ID" \
-            --query "InstanceInformationList[].[InstanceId,PingStatus,PlatformName,AgentVersion]" \
-            --output table
+  version:
+    name: Version (Patch++)
+    runs-on: ubuntu-latest
+    needs: [ build-and-test ]
+    outputs:
+      image_tag: ${{ steps.bump.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # צריך היסטוריה בשביל tags
 
-      - name: Deploy via SSM (TAG targets) + robust path detection
+      - name: Bump patch version and create git tag
+        id: bump
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "== Send SSM Command using TAG target =="
+          git fetch --tags
 
-          # NOTE: לא משתמשים פה ב-set -e בתחילת הסקריפט על השרת
-          # כדי ש-CD שלא קיים לא יפיל הכל. נבדוק ידנית.
-          CMD_ID=$(aws ssm send-command \
-            --region "$AWS_REGION" \
-            --document-name "AWS-RunShellScript" \
-            --targets "Key=tag:${SSM_TAG_KEY},Values=${SSM_TAG_VALUE}" \
-            --comment "GitHub Actions deploy EntryTracker" \
-            --parameters 'commands=[
-              "echo DEPLOY_START: $(date)",
-              "echo RUN_AS=$(id -un) UID=$(id -u) HOME=$HOME SHELL=$SHELL",
-              "",
-              "# נריץ את עיקר העבודה כ-ubuntu כדי ש-~ יעבוד ונתיבים יהיו צפויים",
-              "if id ubuntu >/dev/null 2>&1; then",
-              "  RUN_AS_USER=ubuntu",
-              "else",
-              "  RUN_AS_USER=$(id -un)",
-              "fi",
-              "echo Using user: $RUN_AS_USER",
-              "",
-              "run_as() {",
-              "  if [ \"$RUN_AS_USER\" = \"ubuntu\" ] && [ \"$(id -un)\" = \"root\" ]; then",
-              "    sudo -u ubuntu -H bash -lc \"$1\"",
-              "  else",
-              "    bash -lc \"$1\"",
-              "  fi",
-              "}",
-              "",
-              "run_as \"echo USER=\$(whoami); echo HOME=\$HOME; pwd\"",
-              "run_as \"uname -a\"",
-              "",
-              "# ננסה למצוא את הפרויקט בכמה מקומות נפוצים במקום לנחש",
-              "run_as \"for d in /home/ubuntu/entryTracker /home/ubuntu/entrytracker ~/entryTracker ~/entrytracker /opt/entryTracker /opt/entrytracker; do",
-              "  if [ -d \\\"$d\\\" ]; then",
-              "    echo FOUND_PROJECT_DIR=$d",
-              "    cd \\\"$d\\\"",
-              "    pwd",
-              "    ls -la",
-              "    exit 0",
-              "  fi",
-              "done",
-              "echo PROJECT_DIR_NOT_FOUND; echo listing /home/ubuntu and ~; ls -la /home/ubuntu || true; ls -la ~ || true; exit 2\"",
-              "",
-              "echo DEPLOY_DONE: $(date)"
-            ]' \
-            --query "Command.CommandId" \
-            --output text)
+          # קח את הטאג האחרון בפורמט vX.Y.Z, אם אין - מתחילים מ-v1.0.0
+          LAST_TAG=$(git tag -l "v[0-9]*.[0-9]*.[0-9]*" --sort=-v:refname | head -n 1 || true)
 
-          echo "CommandId: $CMD_ID"
-
-          echo "== Wait for command execution to finish =="
-          set +e
-          aws ssm wait command-executed \
-            --region "$AWS_REGION" \
-            --command-id "$CMD_ID" \
-            --instance-id "$EC2_INSTANCE_ID"
-          WAIT_RC=$?
-          set -e
-
-          STATUS=$(aws ssm get-command-invocation \
-            --region "$AWS_REGION" \
-            --command-id "$CMD_ID" \
-            --instance-id "$EC2_INSTANCE_ID" \
-            --query "Status" \
-            --output text)
-          echo "Invocation Status: $STATUS"
-
-          echo "== STDOUT =="
-          aws ssm get-command-invocation \
-            --region "$AWS_REGION" \
-            --command-id "$CMD_ID" \
-            --instance-id "$EC2_INSTANCE_ID" \
-            --query "StandardOutputContent" \
-            --output text || true
-
-          echo
-          echo "== STDERR =="
-          aws ssm get-command-invocation \
-            --region "$AWS_REGION" \
-            --command-id "$CMD_ID" \
-            --instance-id "$EC2_INSTANCE_ID" \
-            --query "StandardErrorContent" \
-            --output text || true
-
-          echo
-          echo "== Response Code =="
-          RC=$(aws ssm get-command-invocation \
-            --region "$AWS_REGION" \
-            --command-id "$CMD_ID" \
-            --instance-id "$EC2_INSTANCE_ID" \
-            --query "ResponseCode" \
-            --output text || true)
-          echo "$RC"
-
-          if [ "$WAIT_RC" -ne 0 ] || [ "$STATUS" != "Success" ]; then
-            echo "SSM command failed (status=$STATUS, wait_rc=$WAIT_RC, rc=$RC)"
-            exit 1
+          if [ -z "${LAST_TAG}" ]; then
+            NEW_TAG="v1.0.0"
+          else
+            ver="${LAST_TAG#v}"
+            IFS='.' read -r MAJOR MINOR PATCH <<< "$ver"
+            PATCH=$((PATCH + 1))
+            NEW_TAG="v${MAJOR}.${MINOR}.${PATCH}"
           fi
 
-      - name: Post deploy check
+          echo "New tag: ${NEW_TAG}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag "${NEW_TAG}"
+          git push origin "${NEW_TAG}"
+
+          echo "tag=${NEW_TAG}" >> "$GITHUB_OUTPUT"
+
+  build-and-push:
+    name: Build & Push to ECR
+    runs-on: ubuntu-latest
+    needs: [ version ]
+    env:
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+      ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+      IMAGE_TAG: ${{ needs.version.outputs.image_tag }}
+    outputs:
+      image_tag: ${{ needs.version.outputs.image_tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ env.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ env.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build Docker image
         run: |
-          echo "Deploy job finished successfully."
+          docker build -t "${ECR_REPOSITORY}:${IMAGE_TAG}" .
+
+      - name: Tag & Push
+        run: |
+          ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          docker tag "${ECR_REPOSITORY}:${IMAGE_TAG}" "${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+          docker push "${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+
+          # אופציונלי: תתייג גם latest (נוח)
+          docker tag "${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}" "${ECR_REGISTRY}/${ECR_REPOSITORY}:latest"
+          docker push "${ECR_REGISTRY}/${ECR_REPOSITORY}:latest"
+
+  deploy:
+    name: Deploy to EC2 (docker compose)
+    runs-on: ubuntu-latest
+    needs: [ build-and-push ]
+    env:
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+      ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+      EC2_HOST: ${{ secrets.EC2_HOST }}
+      EC2_USER: ${{ secrets.EC2_USER }}
+      IMAGE_TAG: ${{ needs.build-and-push.outputs.image_tag }}
+    steps:
+      - name: Create SSH key file
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/ec2_key.pem
+          chmod 600 ~/.ssh/ec2_key.pem
+
+      - name: Deploy via SSH
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+
+          ssh -o StrictHostKeyChecking=no -i ~/.ssh/ec2_key.pem "${EC2_USER}@${EC2_HOST}" << EOF
+            set -e
+
+            cd /home/ubuntu/entrytracker-cicd
+
+            export ECR_REGISTRY="${ECR_REGISTRY}"
+            export ECR_REPOSITORY="${ECR_REPOSITORY}"
+            export IMAGE_TAG="${IMAGE_TAG}"
+
+            # התחברות ל-ECR (ה-EC2 שלך כבר עם Role, אז זה עובד בלי keys)
+            aws ecr get-login-password --region "${AWS_REGION}" | docker login --username AWS --password-stdin "${ECR_REGISTRY}"
+
+            # pull + restart
+            docker compose pull
+            docker compose up -d --remove-orphans
+
+            docker image prune -f || true
+            docker compose ps
+          EOF
