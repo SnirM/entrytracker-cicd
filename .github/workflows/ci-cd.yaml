@@ -81,7 +81,7 @@ jobs:
             --targets "Key=tag:${SSM_TAG_KEY},Values=${SSM_TAG_VALUE}" \
             --comment "GitHub Actions deploy EntryTracker" \
             --parameters 'commands=[
-              "set -euxo pipefail",
+              "set -eux",
               "echo DEPLOY_START: $(date)",
               "whoami",
               "hostname",
@@ -97,7 +97,6 @@ jobs:
           echo "CommandId: $CMD_ID"
 
           echo "== Wait for command execution to finish =="
-          # לא מפילים ישר; קודם מושכים סטטוס+פלט
           set +e
           aws ssm wait command-executed \
             --region "$AWS_REGION" \
@@ -141,7 +140,6 @@ jobs:
             --query "ResponseCode" \
             --output text || true
 
-          # אם ה-wait נכשל או סטטוס נכשל - מפילים את ה-job
           if [ "$WAIT_RC" -ne 0 ] || [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ] || [ "$STATUS" = "TimedOut" ]; then
             echo "SSM command failed (status=$STATUS, wait_rc=$WAIT_RC)"
             exit 1
