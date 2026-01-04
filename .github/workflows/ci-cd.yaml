@@ -11,7 +11,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # החלף כאן את שלבי הבילד/טסט האמיתיים שלך
       - name: Build & Test
         run: |
           echo "Build/Test here..."
@@ -24,10 +23,8 @@ jobs:
       AWS_REGION: ap-south-1
       AWS_DEFAULT_REGION: ap-south-1
 
-      # Instance ID שלך
       EC2_INSTANCE_ID: i-0d611d3432a0cfcc9
 
-      # TAG target (ודא שהטאג הזה קיים על האינסטנס)
       SSM_TAG_KEY: SSMDeploy
       SSM_TAG_VALUE: entrytracker
 
@@ -35,7 +32,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ✅ AWS Credentials מתוך GitHub Secrets
       - name: Configure AWS credentials (Access Keys)
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -43,7 +39,6 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ap-south-1
 
-      # ✅ Debug: לוודא Account + Region בפועל
       - name: Debug AWS identity + region
         run: |
           set -e
@@ -56,7 +51,6 @@ jobs:
           echo "AWS_REGION=$AWS_REGION"
           echo "AWS_DEFAULT_REGION=$AWS_DEFAULT_REGION"
 
-      # ✅ בדיקה שהאינסטנס קיים בחשבון/אזור הנכונים
       - name: Verify EC2 instance exists in this account/region
         run: |
           set -e
@@ -66,7 +60,6 @@ jobs:
             --query "Reservations[].Instances[].[InstanceId,State.Name,Placement.AvailabilityZone,VpcId,PrivateIpAddress]" \
             --output table
 
-      # ✅ בדיקה שהאינסטנס רשום ל-SSM ובסטטוס Online
       - name: Verify SSM managed instance is ONLINE
         run: |
           set -e
@@ -76,10 +69,10 @@ jobs:
             --query "InstanceInformationList[].[InstanceId,PingStatus,PlatformName,AgentVersion]" \
             --output table
 
-      # Deploy דרך SSM (TAG targets) + Wait נכון עם instance-id
-      - name: Deploy via SSM (TAG targets)
+      - name: Deploy via SSM (TAG targets) + print stdout/stderr on failure
+        shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
           echo "== Send SSM Command using TAG target =="
           CMD_ID=$(aws ssm send-command \
@@ -88,7 +81,7 @@ jobs:
             --targets "Key=tag:${SSM_TAG_KEY},Values=${SSM_TAG_VALUE}" \
             --comment "GitHub Actions deploy EntryTracker" \
             --parameters 'commands=[
-              "set -e",
+              "set -euxo pipefail",
               "echo DEPLOY_START: $(date)",
               "whoami",
               "hostname",
@@ -104,18 +97,55 @@ jobs:
           echo "CommandId: $CMD_ID"
 
           echo "== Wait for command execution to finish =="
+          # לא מפילים ישר; קודם מושכים סטטוס+פלט
+          set +e
           aws ssm wait command-executed \
             --region "$AWS_REGION" \
             --command-id "$CMD_ID" \
             --instance-id "$EC2_INSTANCE_ID"
+          WAIT_RC=$?
+          set -e
 
-          echo "== Fetch command output =="
-          aws ssm list-command-invocations \
+          echo "== Get invocation status =="
+          STATUS=$(aws ssm get-command-invocation \
             --region "$AWS_REGION" \
             --command-id "$CMD_ID" \
-            --details \
-            --query "CommandInvocations[].CommandPlugins[].{Name:Name,Status:Status,Output:Output}" \
-            --output json
+            --instance-id "$EC2_INSTANCE_ID" \
+            --query "Status" \
+            --output text)
+          echo "Invocation Status: $STATUS"
+
+          echo "== STDOUT =="
+          aws ssm get-command-invocation \
+            --region "$AWS_REGION" \
+            --command-id "$CMD_ID" \
+            --instance-id "$EC2_INSTANCE_ID" \
+            --query "StandardOutputContent" \
+            --output text || true
+
+          echo
+          echo "== STDERR =="
+          aws ssm get-command-invocation \
+            --region "$AWS_REGION" \
+            --command-id "$CMD_ID" \
+            --instance-id "$EC2_INSTANCE_ID" \
+            --query "StandardErrorContent" \
+            --output text || true
+
+          echo
+          echo "== Response Code =="
+          aws ssm get-command-invocation \
+            --region "$AWS_REGION" \
+            --command-id "$CMD_ID" \
+            --instance-id "$EC2_INSTANCE_ID" \
+            --query "ResponseCode" \
+            --output text || true
+
+          # אם ה-wait נכשל או סטטוס נכשל - מפילים את ה-job
+          if [ "$WAIT_RC" -ne 0 ] || [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ] || [ "$STATUS" = "TimedOut" ]; then
+            echo "SSM command failed (status=$STATUS, wait_rc=$WAIT_RC)"
+            exit 1
+          fi
 
       - name: Post deploy check
         run: |
