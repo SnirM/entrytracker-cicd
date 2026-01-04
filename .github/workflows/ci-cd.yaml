@@ -2,7 +2,7 @@ name: CI/CD Pipeline
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
 
 jobs:
   build-and-test:
@@ -11,7 +11,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # דוגמה - תחליף לשלבים שלך
+      # החלף לתהליך הבילד/טסט שלך
       - name: Build & Test
         run: |
           echo "Build/Test here..."
@@ -21,14 +21,13 @@ jobs:
     needs: build-and-test
 
     env:
-      # ✅ REGION נכון לפי מה ששלחת
       AWS_REGION: ap-south-1
       AWS_DEFAULT_REGION: ap-south-1
 
-      # אופציונלי (אם עדיין רוצים גם Instance ID)
+      # Instance ID שלך (לפי מה ששלחת קודם)
       EC2_INSTANCE_ID: i-0d611d3432a0cfcc9
 
-      # ✅ TAG targets (מומלץ)
+      # TAG targets - חובה לשים את הטאג הזה על האינסטנס
       SSM_TAG_KEY: SSMDeploy
       SSM_TAG_VALUE: entrytracker
 
@@ -36,27 +35,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # =========================
-      # 1) Configure AWS credentials
-      # =========================
-      # אם אתה עובד עם OIDC (מומלץ):
-      - name: Configure AWS credentials (OIDC)
+      # ✅ Credentials דרך Secrets (Access Keys)
+      - name: Configure AWS credentials (Access Keys)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
-          aws-region: ${{ env.AWS_REGION }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ap-south-1
 
-      # אם אתה עובד עם Access Keys במקום OIDC:
-      # - name: Configure AWS credentials (Access Keys)
-      #   uses: aws-actions/configure-aws-credentials@v4
-      #   with:
-      #     aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      #     aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      #     aws-region: ${{ env.AWS_REGION }}
-
-      # =========================
-      # 2) Debug: זהות + Region בפועל
-      # =========================
+      # Debug: מי אני + באיזה region אני
       - name: Debug AWS identity + region
         run: |
           set -e
@@ -69,33 +56,27 @@ jobs:
           echo "AWS_REGION=$AWS_REGION"
           echo "AWS_DEFAULT_REGION=$AWS_DEFAULT_REGION"
 
-      # =========================
-      # 3) Verify instance exists (כדי להוכיח Region/Account תקין)
-      # =========================
+      # בדיקה שהאינסטנס באמת קיים בחשבון/region הנכון
       - name: Verify EC2 instance exists in this account/region
         run: |
           set -e
           aws ec2 describe-instances \
             --instance-ids "$EC2_INSTANCE_ID" \
             --region "$AWS_REGION" \
-            --query "Reservations[].Instances[].[InstanceId,State.Name,Placement.AvailabilityZone,VpcId,PrivateIpAddress,Tags]" \
+            --query "Reservations[].Instances[].[InstanceId,State.Name,Placement.AvailabilityZone,VpcId,PrivateIpAddress]" \
             --output table
 
-      # =========================
-      # 4) Verify SSM managed instance is ONLINE
-      # =========================
+      # בדיקה שהאינסטנס רשום ב-SSM (Managed instance) וב-Online
       - name: Verify SSM managed instance is ONLINE
         run: |
           set -e
           aws ssm describe-instance-information \
             --region "$AWS_REGION" \
             --filters "Key=InstanceIds,Values=$EC2_INSTANCE_ID" \
-            --query "InstanceInformationList[].[InstanceId,PingStatus,PlatformName,AgentVersion,IPAddress]" \
+            --query "InstanceInformationList[].[InstanceId,PingStatus,PlatformName,AgentVersion]" \
             --output table
 
-      # =========================
-      # 5) Deploy via SSM using TAG targets
-      # =========================
+      # Deploy דרך SSM עם TAG target
       - name: Deploy via SSM (TAG targets)
         run: |
           set -e
