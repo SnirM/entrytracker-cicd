@@ -21,16 +21,12 @@ jobs:
           python-version: "3.11"
 
       - name: Install deps
-        shell: bash
         run: |
-          set -euo pipefail
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
       - name: Basic app import test
-        shell: bash
         run: |
-          set -euo pipefail
           python -c "import app; print('app import OK')"
 
   version:
@@ -40,7 +36,7 @@ jobs:
     outputs:
       image_tag: ${{ steps.bump.outputs.tag }}
     steps:
-      - name: Checkout (full history for tags)
+      - name: Checkout (with tags history)
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -68,7 +64,6 @@ jobs:
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-
           git tag "${NEW_TAG}"
           git push origin "${NEW_TAG}"
 
@@ -78,13 +73,13 @@ jobs:
     name: Build & Push to ECR
     runs-on: ubuntu-latest
     needs: [version]
+    outputs:
+      image_tag: ${{ needs.version.outputs.image_tag }}
     env:
       AWS_REGION: ${{ secrets.AWS_REGION }}
       AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
       ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
       IMAGE_TAG: ${{ needs.version.outputs.image_tag }}
-    outputs:
-      image_tag: ${{ needs.version.outputs.image_tag }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -100,13 +95,10 @@ jobs:
         uses: aws-actions/amazon-ecr-login@v2
 
       - name: Build Docker image
-        shell: bash
         run: |
-          set -euo pipefail
           docker build -t "${ECR_REPOSITORY}:${IMAGE_TAG}" .
 
-      - name: Tag & Push (tag + latest)
-        shell: bash
+      - name: Tag & Push
         run: |
           set -euo pipefail
           ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
@@ -118,84 +110,130 @@ jobs:
           docker push "${ECR_REGISTRY}/${ECR_REPOSITORY}:latest"
 
   deploy:
-    name: Deploy to EC2 (docker compose)
+    name: Deploy to EC2 (SSM + docker compose)
     runs-on: ubuntu-latest
     needs: [build-and-push]
     env:
       AWS_REGION: ${{ secrets.AWS_REGION }}
       AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
       ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
-      EC2_HOST: ${{ secrets.EC2_HOST }}
-      EC2_USER: ${{ secrets.EC2_USER }}
-      EC2_SG_ID: ${{ secrets.EC2_SG_ID }}
       IMAGE_TAG: ${{ needs.build-and-push.outputs.image_tag }}
-    steps:
-      - name: Create SSH key file
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p ~/.ssh
-          echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/ec2_key.pem
-          chmod 600 ~/.ssh/ec2_key.pem
 
-      - name: Configure AWS credentials (for SG open/close)
+      # TAG-based targeting (כמו שעשית אצלך)
+      SSM_TAG_KEY: SSMDeploy
+      SSM_TAG_VALUE: entrytracker
+
+      # נתיב הפרויקט על השרת (אצלך: /home/ubuntu/entrytracker-cicd)
+      PROJECT_DIR: /home/ubuntu/entrytracker-cicd
+
+    steps:
+      - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Temporarily allow SSH from this GitHub runner
+      - name: Verify SSM target(s) exist (by TAG)
         shell: bash
         run: |
           set -euo pipefail
-          RUNNER_IP="$(curl -s https://checkip.amazonaws.com | tr -d '\r\n')/32"
-          echo "Runner IP: $RUNNER_IP"
-          echo "SG: $EC2_SG_ID"
-          aws ec2 authorize-security-group-ingress \
-            --group-id "$EC2_SG_ID" \
-            --ip-permissions "IpProtocol=tcp,FromPort=22,ToPort=22,IpRanges=[{CidrIp=$RUNNER_IP,Description='TEMP GitHub Actions SSH'}]" \
-          || echo "Rule may already exist (ok)"
+          aws ssm describe-instance-information \
+            --region "$AWS_REGION" \
+            --filters "Key=tag:${SSM_TAG_KEY},Values=${SSM_TAG_VALUE}" \
+            --query "InstanceInformationList[].[InstanceId,PingStatus,PlatformName,AgentVersion]" \
+            --output table
 
-      - name: Deploy via SSH
+      - name: Deploy via SSM (AWS-RunShellScript)
         shell: bash
         run: |
           set -euo pipefail
-
-          EC2_HOST_CLEAN="$(echo -n "${EC2_HOST}" | tr -d '\r\n' | xargs)"
-          EC2_USER_CLEAN="$(echo -n "${EC2_USER}" | tr -d '\r\n' | xargs)"
-
-          echo "Using host: [$EC2_HOST_CLEAN]"
-          echo "Using user: [$EC2_USER_CLEAN]"
 
           ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
 
-          ssh -o StrictHostKeyChecking=no -o ConnectTimeout=25 \
-            -i ~/.ssh/ec2_key.pem "${EC2_USER_CLEAN}@${EC2_HOST_CLEAN}" \
-            "set -euo pipefail; \
-             cd /home/ubuntu/entrytracker-cicd; \
-             export AWS_REGION='${AWS_REGION}'; \
-             export ECR_REGISTRY='${ECR_REGISTRY}'; \
-             export ECR_REPOSITORY='${ECR_REPOSITORY}'; \
-             export IMAGE_TAG='${IMAGE_TAG}'; \
-             echo 'Login to ECR...'; \
-             aws ecr get-login-password --region \"\$AWS_REGION\" | docker login --username AWS --password-stdin \"\$ECR_REGISTRY\"; \
-             echo 'Deploy: pull + up...'; \
-             docker compose pull; \
-             docker compose up -d --remove-orphans; \
-             echo 'Cleanup...'; \
-             docker image prune -f || true; \
-             echo 'Status:'; \
-             docker compose ps"
+          echo "Sending SSM command..."
+          CMD_ID="$(aws ssm send-command \
+            --region "$AWS_REGION" \
+            --document-name "AWS-RunShellScript" \
+            --targets "Key=tag:${SSM_TAG_KEY},Values=${SSM_TAG_VALUE}" \
+            --comment "GitHub Actions deploy EntryTracker (ECR + docker compose + nginx)" \
+            --parameters "commands=[
+              \"set -e\",
+              \"echo DEPLOY_START: \$(date)\",
+              \"echo RUN_AS=\$(id -un) UID=\$(id -u)\",
 
-      - name: Revoke temporary SSH rule (always)
-        if: always()
-        shell: bash
-        run: |
-          set -euo pipefail
-          RUNNER_IP="$(curl -s https://checkip.amazonaws.com | tr -d '\r\n')/32"
-          echo "Revoking runner IP: $RUNNER_IP from SG: $EC2_SG_ID"
-          aws ec2 revoke-security-group-ingress \
-            --group-id "$EC2_SG_ID" \
-            --ip-permissions "IpProtocol=tcp,FromPort=22,ToPort=22,IpRanges=[{CidrIp=$RUNNER_IP}]" \
-          || true
+              \"ECR_REGISTRY='${ECR_REGISTRY}'\",
+              \"ECR_REPOSITORY='${ECR_REPOSITORY}'\",
+              \"IMAGE_TAG='${IMAGE_TAG}'\",
+              \"AWS_REGION='${AWS_REGION}'\",
+              \"PROJECT_DIR='${PROJECT_DIR}'\",
+
+              \"echo Using PROJECT_DIR=\${PROJECT_DIR}\",
+              \"cd \${PROJECT_DIR}\",
+              \"ls -la\",
+
+              \"# מתחברים ל-ECR בעזרת ה-Instance Role (אין keys על השרת)\",
+              \"aws ecr get-login-password --region \${AWS_REGION} | docker login --username AWS --password-stdin \${ECR_REGISTRY}\",
+
+              \"# מייצרים/מעדכנים .env ל-compose (פשוט ויציב)\",
+              \"cat > .env << EOF\",
+              \"ECR_REGISTRY=\${ECR_REGISTRY}\",
+              \"ECR_REPOSITORY=\${ECR_REPOSITORY}\",
+              \"IMAGE_TAG=\${IMAGE_TAG}\",
+              \"EOF\",
+
+              \"docker compose pull\",
+              \"docker compose up -d --remove-orphans\",
+              \"docker image prune -f || true\",
+              \"docker compose ps\",
+              \"echo DEPLOY_DONE: \$(date)\"
+            ]" \
+            --query "Command.CommandId" \
+            --output text)"
+
+          echo "CommandId: $CMD_ID"
+
+          echo "Waiting for completion..."
+          aws ssm wait command-executed --region "$AWS_REGION" --command-id "$CMD_ID"
+
+          echo "=== STATUS ==="
+          aws ssm list-command-invocations \
+            --region "$AWS_REGION" \
+            --command-id "$CMD_ID" \
+            --details \
+            --query "CommandInvocations[].Status" \
+            --output text
+
+          echo "=== OUTPUT (first target) ==="
+          INSTANCE_ID="$(aws ssm list-command-invocations \
+            --region "$AWS_REGION" \
+            --command-id "$CMD_ID" \
+            --query "CommandInvocations[0].InstanceId" \
+            --output text)"
+
+          aws ssm get-command-invocation \
+            --region "$AWS_REGION" \
+            --command-id "$CMD_ID" \
+            --instance-id "$INSTANCE_ID" \
+            --query "StandardOutputContent" \
+            --output text
+
+          echo "=== ERRORS (first target) ==="
+          aws ssm get-command-invocation \
+            --region "$AWS_REGION" \
+            --command-id "$CMD_ID" \
+            --instance-id "$INSTANCE_ID" \
+            --query "StandardErrorContent" \
+            --output text || true
+
+          STATUS="$(aws ssm get-command-invocation \
+            --region "$AWS_REGION" \
+            --command-id "$CMD_ID" \
+            --instance-id "$INSTANCE_ID" \
+            --query "Status" \
+            --output text)"
+
+          if [ "$STATUS" != "Success" ]; then
+            echo "SSM deploy failed: $STATUS"
+            exit 1
+          fi
