@@ -22,13 +22,11 @@ jobs:
 
       - name: Install deps
         run: |
-          set -euo pipefail
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
       - name: Basic app import test
         run: |
-          set -euo pipefail
           python -c "import app; print('app import OK')"
 
   version:
@@ -38,7 +36,7 @@ jobs:
     outputs:
       image_tag: ${{ steps.bump.outputs.tag }}
     steps:
-      - name: Checkout (with history)
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -50,7 +48,7 @@ jobs:
           set -euo pipefail
           git fetch --tags
 
-          LAST_TAG="$(git tag -l "v[0-9]*.[0-9]*.[0-9]*" --sort=-v:refname | head -n 1 || true)"
+          LAST_TAG=$(git tag -l "v[0-9]*.[0-9]*.[0-9]*" --sort=-v:refname | head -n 1 || true)
 
           if [ -z "${LAST_TAG}" ]; then
             NEW_TAG="v1.0.0"
@@ -90,17 +88,19 @@ jobs:
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_REGION }}
+          aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to ECR
         uses: aws-actions/amazon-ecr-login@v2
 
       - name: Build Docker image
+        shell: bash
         run: |
           set -euo pipefail
           docker build -t "${ECR_REPOSITORY}:${IMAGE_TAG}" .
 
       - name: Tag & Push
+        shell: bash
         run: |
           set -euo pipefail
           ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
@@ -121,16 +121,19 @@ jobs:
       ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
       IMAGE_TAG: ${{ needs.build-and-push.outputs.image_tag }}
 
+      # ה-TAG של המכונה ב-EC2
       SSM_TAG_KEY: SSMDeploy
       SSM_TAG_VALUE: entrytracker
 
+      # נתיב הפרויקט על השרת (חובה!)
+      PROJECT_DIR: ${{ secrets.PROJECT_DIR }}
     steps:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_REGION }}
+          aws-region: ${{ env.AWS_REGION }}
 
       - name: Debug identity
         shell: bash
@@ -145,132 +148,129 @@ jobs:
         run: |
           set -euo pipefail
           INSTANCE_ID="$(aws ec2 describe-instances \
-            --region "$AWS_REGION" \
-            --filters \
-              "Name=tag:${SSM_TAG_KEY},Values=${SSM_TAG_VALUE}" \
-              "Name=instance-state-name,Values=running" \
-            --query "Reservations[].Instances[0].InstanceId" \
+            --region "${AWS_REGION}" \
+            --filters "Name=tag:${SSM_TAG_KEY},Values=${SSM_TAG_VALUE}" "Name=instance-state-name,Values=running" \
+            --query "Reservations[].Instances[].InstanceId" \
             --output text)"
 
           if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" = "None" ]; then
-            echo "ERROR: No running instance found with tag ${SSM_TAG_KEY}=${SSM_TAG_VALUE}"
+            echo "No running instance found with tag ${SSM_TAG_KEY}=${SSM_TAG_VALUE}"
             exit 1
           fi
 
-          echo "INSTANCE_ID=$INSTANCE_ID"
           echo "instance_id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
+          echo "Resolved INSTANCE_ID: $INSTANCE_ID"
 
       - name: Verify SSM Online
         shell: bash
         run: |
           set -euo pipefail
           INSTANCE_ID="${{ steps.resolve.outputs.instance_id }}"
+
           aws ssm describe-instance-information \
-            --region "$AWS_REGION" \
-            --filters "Key=InstanceIds,Values=$INSTANCE_ID" \
-            --query "InstanceInformationList[0].[InstanceId,PingStatus,PlatformName,AgentVersion]" \
+            --region "${AWS_REGION}" \
+            --filters "Key=InstanceIds,Values=${INSTANCE_ID}" \
+            --query "InstanceInformationList[].[InstanceId,PingStatus,PlatformName,AgentVersion]" \
             --output table
+
+          PING="$(aws ssm describe-instance-information \
+            --region "${AWS_REGION}" \
+            --filters "Key=InstanceIds,Values=${INSTANCE_ID}" \
+            --query "InstanceInformationList[0].PingStatus" \
+            --output text)"
+
+          if [ "$PING" != "Online" ]; then
+            echo "SSM agent is not Online (PingStatus=$PING)"
+            exit 1
+          fi
 
       - name: Deploy via SSM (AWS-RunShellScript)
         shell: bash
         run: |
           set -euo pipefail
 
+          if [ -z "${PROJECT_DIR:-}" ]; then
+            echo "PROJECT_DIR secret is missing. Example: /home/ubuntu/entrytracker-cicd"
+            exit 1
+          fi
+
           INSTANCE_ID="${{ steps.resolve.outputs.instance_id }}"
           ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
 
-          echo "Deploying to: $INSTANCE_ID"
-          echo "ECR: $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          echo "Deploying to: ${INSTANCE_ID}"
+          echo "ECR: ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+          echo "PROJECT_DIR: ${PROJECT_DIR}"
 
-          # jq קיים על ubuntu-latest. בונים JSON בלי בעיות escaping
-          PARAMS_JSON="$(jq -nc \
-            --arg aws_region "$AWS_REGION" \
-            --arg ecr_registry "$ECR_REGISTRY" \
-            --arg ecr_repo "$ECR_REPOSITORY" \
-            --arg image_tag "$IMAGE_TAG" \
-            '{
-              commands: [
-                "set -euo pipefail",
-                "echo DEPLOY_START: $(date)",
-                "echo WHOAMI=$(whoami) UID=$(id -u) HOME=$HOME",
-                ("export AWS_REGION=\"" + $aws_region + "\""),
-                ("export ECR_REGISTRY=\"" + $ecr_registry + "\""),
-                ("export ECR_REPOSITORY=\"" + $ecr_repo + "\""),
-                ("export IMAGE_TAG=\"" + $image_tag + "\""),
-                "",
-                "PROJECT_DIR=\"\"",
-                "for d in /home/ubuntu/entrytracker-cicd /home/ubuntu/entrytracker /opt/entrytracker-cicd /opt/entrytracker; do if [ -d \"$d\" ]; then PROJECT_DIR=\"$d\"; break; fi; done",
-                "if [ -z \"$PROJECT_DIR\" ]; then echo \"ERROR: PROJECT_DIR not found\"; ls -la /home/ubuntu || true; exit 2; fi",
-                "echo PROJECT_DIR=$PROJECT_DIR",
-                "cd \"$PROJECT_DIR\"",
-                "ls -la",
-                "",
-                "docker --version",
-                "docker compose version || true",
-                "",
-                "aws ecr get-login-password --region \"$AWS_REGION\" | docker login --username AWS --password-stdin \"$ECR_REGISTRY\"",
-                "docker compose pull",
-                "docker compose up -d --remove-orphans",
-                "docker image prune -f || true",
-                "docker compose ps",
-                "echo DEPLOY_DONE: $(date)"
-              ]
-            }')"
-
-          echo "Sending SSM command..."
+          # שים לב: בתוך SSM אנחנו רצים ב-/bin/sh, לכן אין pipefail!
           CMD_ID="$(aws ssm send-command \
-            --region "$AWS_REGION" \
+            --region "${AWS_REGION}" \
             --document-name "AWS-RunShellScript" \
-            --instance-ids "$INSTANCE_ID" \
-            --comment "GitHub Actions deploy via SSM" \
-            --parameters "$PARAMS_JSON" \
+            --instance-ids "${INSTANCE_ID}" \
+            --comment "Deploy EntryTracker via SSM + docker compose" \
+            --parameters commands="[
+              \"echo DEPLOY_START: \$(date)\",
+              \"echo RUN_AS=\$(id -un) UID=\$(id -u) SHELL=\$SHELL\",
+              \"cd ${PROJECT_DIR}\",
+              \"echo PWD=\$(pwd)\",
+              \"ls -la\",
+              \"export ECR_REGISTRY=${ECR_REGISTRY}\",
+              \"export ECR_REPOSITORY=${ECR_REPOSITORY}\",
+              \"export IMAGE_TAG=${IMAGE_TAG}\",
+              \"echo Using IMAGE=\${ECR_REGISTRY}/\${ECR_REPOSITORY}:\${IMAGE_TAG}\",
+              \"aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}\",
+              \"docker compose pull\",
+              \"docker compose up -d --remove-orphans\",
+              \"docker image prune -f || true\",
+              \"docker compose ps\",
+              \"echo DEPLOY_DONE: \$(date)\"
+            ]" \
             --query "Command.CommandId" \
             --output text)"
 
           echo "CommandId: $CMD_ID"
-          echo "Waiting for completion..."
 
           set +e
           aws ssm wait command-executed \
-            --region "$AWS_REGION" \
+            --region "${AWS_REGION}" \
             --command-id "$CMD_ID" \
-            --instance-id "$INSTANCE_ID"
+            --instance-id "${INSTANCE_ID}"
           WAIT_RC=$?
           set -e
 
           STATUS="$(aws ssm get-command-invocation \
-            --region "$AWS_REGION" \
+            --region "${AWS_REGION}" \
             --command-id "$CMD_ID" \
-            --instance-id "$INSTANCE_ID" \
+            --instance-id "${INSTANCE_ID}" \
             --query "Status" \
             --output text)"
 
           RC="$(aws ssm get-command-invocation \
-            --region "$AWS_REGION" \
+            --region "${AWS_REGION}" \
             --command-id "$CMD_ID" \
-            --instance-id "$INSTANCE_ID" \
+            --instance-id "${INSTANCE_ID}" \
             --query "ResponseCode" \
-            --output text || true)"
+            --output text)"
 
           echo "Invocation Status: $STATUS"
           echo "Response Code: $RC"
           echo "===== STDOUT ====="
           aws ssm get-command-invocation \
-            --region "$AWS_REGION" \
+            --region "${AWS_REGION}" \
             --command-id "$CMD_ID" \
-            --instance-id "$INSTANCE_ID" \
+            --instance-id "${INSTANCE_ID}" \
             --query "StandardOutputContent" \
             --output text || true
+
           echo
           echo "===== STDERR ====="
           aws ssm get-command-invocation \
-            --region "$AWS_REGION" \
+            --region "${AWS_REGION}" \
             --command-id "$CMD_ID" \
-            --instance-id "$INSTANCE_ID" \
+            --instance-id "${INSTANCE_ID}" \
             --query "StandardErrorContent" \
             --output text || true
 
-          if [ "$WAIT_RC" -ne 0 ] || [ "$STATUS" != "Success" ]; then
+          if [ "$WAIT_RC" -ne 0 ] || [ "$STATUS" != "Success" ] || [ "$RC" != "0" ]; then
             echo "SSM deploy failed (status=$STATUS, wait_rc=$WAIT_RC, rc=$RC)"
             exit 1
           fi
