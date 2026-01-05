@@ -22,11 +22,13 @@ jobs:
 
       - name: Install deps
         run: |
+          set -euo pipefail
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
       - name: Basic app import test
         run: |
+          set -euo pipefail
           python -c "import app; print('app import OK')"
 
   version:
@@ -46,10 +48,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           git fetch --tags
 
-          LAST_TAG=$(git tag -l "v[0-9]*.[0-9]*.[0-9]*" --sort=-v:refname | head -n 1 || true)
+          LAST_TAG="$(git tag -l "v[0-9]*.[0-9]*.[0-9]*" --sort=-v:refname | head -n 1 || true)"
 
           if [ -z "${LAST_TAG}" ]; then
             NEW_TAG="v1.0.0"
@@ -107,12 +108,11 @@ jobs:
           docker tag "${ECR_REPOSITORY}:${IMAGE_TAG}" "${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
           docker push "${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
 
-          # Optional: latest
           docker tag "${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}" "${ECR_REGISTRY}/${ECR_REPOSITORY}:latest"
           docker push "${ECR_REGISTRY}/${ECR_REPOSITORY}:latest"
 
   deploy:
-    name: Deploy to EC2 (SSM + docker compose)
+    name: Deploy to EC2 via SSM (docker compose)
     runs-on: ubuntu-latest
     needs: [build-and-push]
     env:
@@ -121,7 +121,6 @@ jobs:
       ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
       IMAGE_TAG: ${{ needs.build-and-push.outputs.image_tag }}
 
-      # TAG שעל פיו מאתרים את ה-EC2
       SSM_TAG_KEY: SSMDeploy
       SSM_TAG_VALUE: entrytracker
 
@@ -133,19 +132,18 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Debug AWS identity + region
+      - name: Debug identity
         shell: bash
         run: |
           set -euo pipefail
           aws sts get-caller-identity
           aws configure list
 
-      - name: Resolve EC2 Instance by TAG (must be running)
+      - name: Resolve EC2 instance by TAG (running)
         id: resolve
         shell: bash
         run: |
           set -euo pipefail
-
           INSTANCE_ID="$(aws ec2 describe-instances \
             --region "$AWS_REGION" \
             --filters \
@@ -159,7 +157,7 @@ jobs:
             exit 1
           fi
 
-          echo "Resolved INSTANCE_ID=$INSTANCE_ID"
+          echo "INSTANCE_ID=$INSTANCE_ID"
           echo "instance_id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
 
       - name: Verify SSM Online
@@ -181,60 +179,43 @@ jobs:
           INSTANCE_ID="${{ steps.resolve.outputs.instance_id }}"
           ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
 
-          echo "Deploying to InstanceId: $INSTANCE_ID"
-          echo "ECR_REGISTRY: $ECR_REGISTRY"
-          echo "ECR_REPOSITORY: $ECR_REPOSITORY"
-          echo "IMAGE_TAG: $IMAGE_TAG"
+          echo "Deploying to: $INSTANCE_ID"
+          echo "ECR: $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
 
-          # בונים JSON בצורה בטוחה (בלי בעיות escaping)
-          PARAMS_JSON="$(python - <<'PY'
-import json, os
-aws_region = os.environ["AWS_REGION"]
-ecr_registry = f'{os.environ["AWS_ACCOUNT_ID"]}.dkr.ecr.{aws_region}.amazonaws.com'
-ecr_repo = os.environ["ECR_REPOSITORY"]
-image_tag = os.environ["IMAGE_TAG"]
-
-cmds = [
-  "set -euo pipefail",
-  "echo DEPLOY_START: $(date)",
-  "echo WHOAMI=$(whoami) UID=$(id -u) HOME=$HOME",
-  "",
-  f'export AWS_REGION="{aws_region}"',
-  f'export ECR_REGISTRY="{ecr_registry}"',
-  f'export ECR_REPOSITORY="{ecr_repo}"',
-  f'export IMAGE_TAG="{image_tag}"',
-  "",
-  "# נאתר את תיקיית הפרויקט (לא תלוי ב-SECRET של PROJECT_DIR)",
-  "PROJECT_DIR=''",
-  "for d in /home/ubuntu/entrytracker-cicd /home/ubuntu/entrytracker-cicd/ /home/ubuntu/entrytracker /home/ubuntu/entrytracker-cicd-nginx /opt/entrytracker-cicd /opt/entrytracker; do",
-  "  if [ -d \"$d\" ]; then PROJECT_DIR=\"$d\"; break; fi",
-  "done",
-  "if [ -z \"$PROJECT_DIR\" ]; then",
-  "  echo 'ERROR: PROJECT_DIR not found. Listing /home/ubuntu:'",
-  "  ls -la /home/ubuntu || true",
-  "  exit 2",
-  "fi",
-  "echo PROJECT_DIR=$PROJECT_DIR",
-  "cd \"$PROJECT_DIR\"",
-  "ls -la",
-  "",
-  "# בדיקות בסיס",
-  "docker --version",
-  "docker compose version || docker-compose --version || true",
-  "",
-  "# Login to ECR (דרך ה-IAM Role של ה-EC2)",
-  "aws ecr get-login-password --region \"$AWS_REGION\" | docker login --username AWS --password-stdin \"$ECR_REGISTRY\"",
-  "",
-  "# Pull + restart",
-  "docker compose pull",
-  "docker compose up -d --remove-orphans",
-  "docker image prune -f || true",
-  "docker compose ps",
-  "echo DEPLOY_DONE: $(date)"
-]
-print(json.dumps({"commands": cmds}))
-PY
-)"
+          # jq קיים על ubuntu-latest. בונים JSON בלי בעיות escaping
+          PARAMS_JSON="$(jq -nc \
+            --arg aws_region "$AWS_REGION" \
+            --arg ecr_registry "$ECR_REGISTRY" \
+            --arg ecr_repo "$ECR_REPOSITORY" \
+            --arg image_tag "$IMAGE_TAG" \
+            '{
+              commands: [
+                "set -euo pipefail",
+                "echo DEPLOY_START: $(date)",
+                "echo WHOAMI=$(whoami) UID=$(id -u) HOME=$HOME",
+                ("export AWS_REGION=\"" + $aws_region + "\""),
+                ("export ECR_REGISTRY=\"" + $ecr_registry + "\""),
+                ("export ECR_REPOSITORY=\"" + $ecr_repo + "\""),
+                ("export IMAGE_TAG=\"" + $image_tag + "\""),
+                "",
+                "PROJECT_DIR=\"\"",
+                "for d in /home/ubuntu/entrytracker-cicd /home/ubuntu/entrytracker /opt/entrytracker-cicd /opt/entrytracker; do if [ -d \"$d\" ]; then PROJECT_DIR=\"$d\"; break; fi; done",
+                "if [ -z \"$PROJECT_DIR\" ]; then echo \"ERROR: PROJECT_DIR not found\"; ls -la /home/ubuntu || true; exit 2; fi",
+                "echo PROJECT_DIR=$PROJECT_DIR",
+                "cd \"$PROJECT_DIR\"",
+                "ls -la",
+                "",
+                "docker --version",
+                "docker compose version || true",
+                "",
+                "aws ecr get-login-password --region \"$AWS_REGION\" | docker login --username AWS --password-stdin \"$ECR_REGISTRY\"",
+                "docker compose pull",
+                "docker compose up -d --remove-orphans",
+                "docker image prune -f || true",
+                "docker compose ps",
+                "echo DEPLOY_DONE: $(date)"
+              ]
+            }')"
 
           echo "Sending SSM command..."
           CMD_ID="$(aws ssm send-command \
